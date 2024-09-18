@@ -1,0 +1,109 @@
+name: Flask Task Manager CI/CD
+
+on:
+  push:
+    branches:
+      - develop
+  pull_request:
+    branches:
+      - develop
+
+jobs:
+  # Etapa 1: Build da aplicação
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checar o repositório
+        uses: actions/checkout@v3
+
+      - name: Instalar dependências do Python
+        run: |
+          python3 -m venv venv
+          source venv/bin/activate
+          pip install -r requirements.txt
+
+      - name: Construir Docker Image
+        run: |
+          docker build -t task-manager-flask:latest .
+
+      # Análise de segurança estática com Bandit
+      - name: Rodar Bandit
+        run: |
+          pip install bandit
+          bandit -r ./todo_project/todo_project
+
+  # Etapa 2: Testes com OWASP ZAP
+  zap_scan:
+    runs-on: ubuntu-latest
+
+    services:
+      # Serviço para a aplicação a ser testada
+      app:
+        image: task-manager-flask:latest
+        ports:
+          - 8081:8080
+        options: > 
+          --health-cmd="curl --fail http://localhost:8080/ || exit 1"
+          --health-interval=10s
+          --health-timeout=5s
+          --health-retries=5
+
+      # Serviço para o OWASP ZAP
+      zap:
+        image: owasp/zap2docker-stable
+        ports:
+          - 8090:8090
+        options: > 
+          -u 0.0.0.0
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v3
+
+      - name: Build Docker image
+        run: |
+          docker build -t task-manager-flask:latest .
+
+      - name: Wait for application to be healthy
+        run: |
+          for i in {1..30}; do
+            docker inspect --format='{{json .State.Health.Status}}' $(docker ps -q --filter "ancestor=task-manager-flask:latest") | grep "healthy" && exit 0
+            echo "Waiting for app to be healthy..."
+            sleep 5
+          done
+          echo "App did not become healthy in time"
+          exit 1
+
+      - name: Run OWASP ZAP Scan
+        env:
+          ZAP_HOST: localhost
+          ZAP_PORT: 8090
+          TARGET_URL: http://localhost:8081
+        run: |
+          # Iniciar o ZAP em background
+          docker exec -d $(docker ps -q --filter "ancestor=owasp/zap2docker-stable") zap.sh -daemon -host 0.0.0.0 -port 8090 -config api.disablekey=true
+
+          # Aguarde o ZAP iniciar
+          sleep 30
+
+          # Iniciar o scan
+          docker exec $(docker ps -q --filter "ancestor=owasp/zap2docker-stable") zap-cli --zap-url http://localhost:8090 --timeout 1200 spider $TARGET_URL
+          docker exec $(docker ps -q --filter "ancestor=owasp/zap2docker-stable") zap-cli --zap-url http://localhost:8090 active-scan $TARGET_URL
+
+          # Gerar o relatório
+          docker exec $(docker ps -q --filter "ancestor=owasp/zap2docker-stable") zap-cli --zap-url http://localhost:8090 report -o zap-report.html -f html
+
+      - name: Upload ZAP Report
+        uses: actions/upload-artifact@v3
+        with:
+          name: zap-report
+          path: zap-report.html
+
+      - name: Upload ZAP Report to GitHub Pages (Optional)
+        if: always()
+        uses: peaceiris/actions-gh-pages@v3
+        with:
+          github_token: ${{ secrets.GITHUB_TOKEN }}
+          publish_dir: ./zap-report.html
+          publish_branch: gh-pages
+          force_orphan: true
